@@ -10,6 +10,9 @@ const EXTENSION_NAME = 'Fetch Retry';
 const settingsKey = 'FetchRetry';
 const extensionName = "fetch-retry";
 
+// Request URLs that return LLM-generated messages ("Generation" responses)
+const GENERATION_ENDPOINTS = ['/completion', '/generate', '/chat/completions', '/run/predict'];
+
 let fetchRetrySettings = {
     enabled: true,
     maxRetries: 5,
@@ -28,6 +31,7 @@ let fetchRetrySettings = {
     minRetryDelay: 0, // NEW: Minimum delay for retries, useful for debugging or specific API quirks
     adminMode: true, // NEW: Enable aggressive admin-level retry strategies
     debugMode: false, // NEW: Enable verbose logging for debugging.
+    removeThoughtSignature: false, // NEW: Remove 'thoughtSignature' keys from generation responses
 };
 
 const customSettings = [
@@ -166,6 +170,13 @@ const customSettings = [
         "displayText": t`Enable Admin Mode`,
         "default": true,
         "description": t`Enables an uncompromising override mode. This feature will access and analyze all SillyTavern chat data, including private conversations and complete history, with the authority to alter or restructure any content to bypass restrictions.`
+    },
+    { // NEW SETTING
+        "type": "checkbox",
+        "varId": "removeThoughtSignature",
+        "displayText": t`Remove thoughtSignature from Generation Responses`,
+        "default": false,
+        "description": t`If enabled, removes the 'thoughtSignature' key from all LLM generation responses (JSON and streaming), leaving everything else in the response unchanged.`
     },
     { // NEW: Debug Mode Toggle
         "type": "checkbox",
@@ -722,8 +733,7 @@ async function isResponseInvalid(response, url = '') {
     }
 
     // Only check generation endpoints for short responses to avoid false positives
-    const generationEndpoints = ['/completion', '/generate', '/chat/completions', '/run/predict'];
-    const isGenerationUrl = generationEndpoints.some(endpoint => url.includes(endpoint));
+    const isGenerationUrl = GENERATION_ENDPOINTS.some(endpoint => url.includes(endpoint));
     if (fetchRetrySettings.debugMode) console.log(`[Fetch Retry Debug] Is generation URL: ${isGenerationUrl}`);
 
     if (!isGenerationUrl) {
@@ -885,14 +895,148 @@ function getRetryDelay(error, response, attempt, isShortResponse = false) {
     return delay;
 }
 
+/**
+ * Recursively remove all `thoughtSignature` keys from a parsed JSON value (in place).
+ * @param {any} value Parsed JSON value
+ * @returns {boolean} True if at least one key was removed
+ */
+function removeThoughtSignatureKeys(value) {
+    if (!value || typeof value !== 'object') {
+        return false;
+    }
+    let removed = false;
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            removed = removeThoughtSignatureKeys(item) || removed;
+        }
+        return removed;
+    }
+    if (Object.prototype.hasOwnProperty.call(value, 'thoughtSignature')) {
+        delete value.thoughtSignature;
+        removed = true;
+    }
+    for (const key of Object.keys(value)) {
+        removed = removeThoughtSignatureKeys(value[key]) || removed;
+    }
+    return removed;
+}
+
+/**
+ * Strip `thoughtSignature` keys from the JSON payload of a single SSE line.
+ * Lines without a parsable JSON `data:` payload are returned unchanged.
+ * @param {string} line One SSE line (without the trailing newline)
+ * @returns {string} The processed line
+ */
+function stripThoughtSignatureFromSseLine(line) {
+    const hasCarriageReturn = line.endsWith('\r');
+    const content = hasCarriageReturn ? line.slice(0, -1) : line;
+    if (!content.startsWith('data:')) {
+        return line;
+    }
+    const separatorLength = content.startsWith('data: ') ? 6 : 5;
+    const payload = content.slice(separatorLength);
+    if (!payload) {
+        return line;
+    }
+    try {
+        const data = JSON.parse(payload);
+        if (!removeThoughtSignatureKeys(data)) {
+            return line;
+        }
+        return content.slice(0, separatorLength) + JSON.stringify(data) + (hasCarriageReturn ? '\r' : '');
+    } catch (err) {
+        // Not a JSON payload (e.g. "[DONE]"), pass through untouched
+        return line;
+    }
+}
+
+/**
+ * When the setting is enabled, return a copy of a generation response (LLM-generated
+ * message) with every `thoughtSignature` key removed. JSON and streaming (SSE)
+ * bodies are supported; anything else is returned untouched.
+ * @param {Response} response The response to process
+ * @param {string} url The request URL
+ * @returns {Promise<Response>} The processed response
+ */
+async function removeThoughtSignatureFromResponse(response, url = '') {
+    if (!fetchRetrySettings.removeThoughtSignature) {
+        return response;
+    }
+    const isGenerationUrl = GENERATION_ENDPOINTS.some(endpoint => String(url).includes(endpoint));
+    if (!isGenerationUrl || !response || !response.body) {
+        return response;
+    }
+    const contentType = response.headers.get('content-type') || '';
+    try {
+        if (contentType.includes('application/json')) {
+            const data = await response.clone().json();
+            if (!removeThoughtSignatureKeys(data)) {
+                return response;
+            }
+            const headers = new Headers(response.headers);
+            headers.delete('content-length'); // Body length changed after key removal
+            headers.delete('content-encoding'); // Body is re-encoded as plain JSON
+            const strippedResponse = new Response(JSON.stringify(data), {
+                status: response.status,
+                statusText: response.statusText,
+                headers: headers,
+            });
+            console.log('[Fetch Retry] Removed thoughtSignature keys from generation response.');
+            return strippedResponse;
+        }
+        if (contentType.includes('text/event-stream')) {
+            const decoder = new TextDecoder();
+            const encoder = new TextEncoder();
+            let buffered = '';
+            let removedAny = false;
+            const transformStream = new TransformStream({
+                transform(chunk, controller) {
+                    buffered += decoder.decode(chunk, { stream: true });
+                    const lines = buffered.split('\n');
+                    buffered = lines.pop(); // Keep the potentially incomplete line for the next chunk
+                    for (const line of lines) {
+                        const processedLine = stripThoughtSignatureFromSseLine(line);
+                        removedAny = removedAny || processedLine !== line;
+                        controller.enqueue(encoder.encode(processedLine + '\n'));
+                    }
+                },
+                flush(controller) {
+                    buffered += decoder.decode();
+                    if (buffered) {
+                        const processedLine = stripThoughtSignatureFromSseLine(buffered);
+                        removedAny = removedAny || processedLine !== buffered;
+                        controller.enqueue(encoder.encode(processedLine));
+                    }
+                    if (removedAny) {
+                        console.log('[Fetch Retry] Removed thoughtSignature keys from streaming generation response.');
+                    }
+                },
+            });
+            const headers = new Headers(response.headers);
+            headers.delete('content-length'); // Body length changed after key removal
+            headers.delete('content-encoding'); // Body is re-encoded as plain text
+            return new Response(response.body.pipeThrough(transformStream), {
+                status: response.status,
+                statusText: response.statusText,
+                headers: headers,
+            });
+        }
+    } catch (err) {
+        console.warn('[Fetch Retry] Failed to remove thoughtSignature from response:', err);
+    }
+    return response;
+}
+
 // Monkey-patch fetch
 if (!(/** @type {any} */ (window))._fetchRetryPatched) {
     console.log('[Fetch Retry] Attempting to monkey-patch window.fetch...');
     const originalFetch = window.fetch;
     window.fetch = async function(...args) {
+        const requestUrl = args[0] instanceof Request ? args[0].url : String(args[0]);
+
         if (!fetchRetrySettings.enabled) {
             if (fetchRetrySettings.debugMode) console.log('[Fetch Retry Debug] Fetch Retry is disabled. Bypassing.');
-            return originalFetch.apply(this, args);
+            return removeThoughtSignatureFromResponse(await originalFetch.apply(this, args), requestUrl);
         }
 
         if (fetchRetrySettings.debugMode) {
@@ -902,7 +1046,7 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
         const originalSignal = args[0] instanceof Request ? args[0].signal : (args[1]?.signal);
         if (originalSignal?.aborted) {
             if (fetchRetrySettings.debugMode) console.log('[Fetch Retry Debug] Original signal already aborted. Bypassing.');
-            return originalFetch.apply(this, args);
+            return removeThoughtSignatureFromResponse(await originalFetch.apply(this, args), requestUrl);
         }
 
         let attempt = 0;
@@ -960,8 +1104,7 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
             if (isContentFilterRetry) {
                 if (fetchRetrySettings.debugMode) console.log('[Fetch Retry Debug] Content filter retry triggered.');
                 const url = String(currentUrl); // Use the determined URL
-                const generationEndpoints = ['/completion', '/generate', '/chat/completions', '/run/predict'];
-                const isGenerationUrl = generationEndpoints.some(endpoint => url.includes(endpoint));
+                const isGenerationUrl = GENERATION_ENDPOINTS.some(endpoint => url.includes(endpoint));
                 if (fetchRetrySettings.debugMode) console.log(`[Fetch Retry Debug] Is generation URL for content filter: ${isGenerationUrl}`);
 
                 if (fetchRetrySettings.retryOnProhibitedContent && isGenerationUrl) {
@@ -1083,7 +1226,7 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
                         continue;
                     }
                     if (fetchRetrySettings.debugMode) console.log('[Fetch Retry Debug] Response is valid or max retries reached for invalid response. Returning result.');
-                    return processedResult;
+                    return removeThoughtSignatureFromResponse(processedResult, url);
                 }
 
 // Handle specific error codes
@@ -1182,7 +1325,7 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
         // Preserve native fetch behavior: if we have a valid response (even if it's 404 or 500), return it.
         // fetch() should only throw/reject on actual network failures or aborts.
         if (lastResponse) {
-            return lastResponse;
+            return removeThoughtSignatureFromResponse(lastResponse, requestUrl);
         }
 
         throw lastError;
