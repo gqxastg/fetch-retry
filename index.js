@@ -24,6 +24,7 @@ let fetchRetrySettings = {
     streamInactivityTimeout: 30000, // ms, timeout for stream inactivity
     retryOnStopFinishReason: true, // NEW: Retry if AI stops with 'STOP' finish reason and response is too short
     retryOnProhibitedContent: true, // NEW: Retry if AI response indicates prohibited content
+    retryOnSafetyFinishReason: true, // NEW: Retry if Google AI returns 'SAFETY' finish reason
     minRetryDelay: 0, // NEW: Minimum delay for retries, useful for debugging or specific API quirks
     adminMode: true, // NEW: Enable aggressive admin-level retry strategies
     debugMode: false, // NEW: Enable verbose logging for debugging.
@@ -141,6 +142,13 @@ const customSettings = [
         "displayText": t`Retry on Prohibited Content`,
         "default": true,
         "description": t`If enabled, retries the request when the AI response indicates prohibited content, transforming user messages to system messages with a prompt.`
+    },
+    { // 新增：因 SAFETY 拦截重试
+        "type": "checkbox",
+        "varId": "retryOnSafetyFinishReason",
+        "displayText": t`Retry on 'SAFETY' Finish Reason`,
+        "default": true,
+        "description": t`If enabled, retries the request when Google AI returns 'SAFETY' as the finish reason.`
     },
     { // NEW SETTING
         "type": "slider",
@@ -665,10 +673,10 @@ function showErrorNotification(error, response) {
         console.log('[Fetch Retry] Error notifications are disabled.');
         return;
     }
-    
+
     let message = 'Fetch failed after all retries';
     let type = 'error';
-    
+
     if (response) {
         if (response.status === 429) {
             message = `Rate limited (429): Too many requests`;
@@ -690,7 +698,7 @@ function showErrorNotification(error, response) {
                 message = `Network error: ${error.message}`;
             }
     }
-    
+
     // Use SillyTavern's toast notification if available
     if (typeof toastr !== 'undefined') {
         /** @type {any} */ (toastr)[type](message, 'Fetch Retry');
@@ -708,7 +716,7 @@ async function isResponseInvalid(response, url = '') {
     if (fetchRetrySettings.debugMode) {
         console.log('[Fetch Retry Debug] Checking response validity for URL:', url);
     }
-    if (!fetchRetrySettings.checkEmptyResponse && !fetchRetrySettings.streamInactivityTimeout && !fetchRetrySettings.retryOnStopFinishReason && !fetchRetrySettings.retryOnProhibitedContent) {
+    if (!fetchRetrySettings.checkEmptyResponse && !fetchRetrySettings.streamInactivityTimeout && !fetchRetrySettings.retryOnStopFinishReason && !fetchRetrySettings.retryOnProhibitedContent && !fetchRetrySettings.retryOnSafetyFinishReason) {
         if (fetchRetrySettings.debugMode) console.log('[Fetch Retry Debug] All response validity checks are disabled by settings.');
         return { invalid: false, reason: '' };
     }
@@ -722,7 +730,7 @@ async function isResponseInvalid(response, url = '') {
         if (fetchRetrySettings.debugMode) console.log('[Fetch Retry Debug] Not a generation URL, skipping detailed response checks.');
         return { invalid: false, reason: '' };
     }
-    
+
     try {
         // Clone response so it can be read again later
         const clonedResponse = response.clone();
@@ -765,16 +773,20 @@ async function isResponseInvalid(response, url = '') {
 
             // NEW: Check for error object in the JSON response body, even on 200 OK
             if (data.error && data.error.message && typeof data.error.message === 'string') {
-                if (/prohibited|candidate/i.test(data.error.message)) {
+                if (data.error.message.includes('Candidate was prohibited due to finishReason: PROHIBITED_CONTENT')) { // if (/prohibited|candidate/i.test(data.error.message)) {
                     console.warn(`[Fetch Retry] Detected prohibited content error in JSON response body. Retrying...`);
                     return { invalid: true, reason: 'prohibited_content' };
                 }
-            }
-
-            // NEW: Check for Google AI Studio 'Candidate text empty' error in the error message
-            if (data.error && typeof data.error.message === 'string' && data.error.message.includes('Candidate text empty')) {
-                console.warn(`[Fetch Retry] Detected Google AI Studio 'Candidate text empty' error in JSON response. Retrying...`);
-                return { invalid: true, reason: 'google_ai_studio_error' };
+                // 新增：检查 finishReason 是否为 'SAFETY'
+                if (data.error.message.includes('Candidate was prohibited due to finishReason: SAFETY')) {
+                    console.warn(`[Fetch Retry] Detected safety error in JSON response body. Retrying...`);
+                    return { invalid: true, reason: 'safety_reason' };
+                }
+                // NEW: Check for 'Candidate text empty' error in the error message
+                if (data.error.message.includes('Candidate text empty')) {
+                    console.warn(`[Fetch Retry] Detected 'Candidate text empty' error in JSON response. Retrying...`);
+                    return { invalid: true, reason: 'google_ai_studio_error' };
+                }
             }
 
             // NEW: Check for Google AI (Gemini) prohibited content reason or empty candidate
@@ -783,6 +795,11 @@ async function isResponseInvalid(response, url = '') {
                 if (candidate.finishReason === 'PROHIBITED_CONTENT') {
                     console.warn(`[Fetch Retry] Google AI returned 'PROHIBITED_CONTENT'. Retrying...`);
                     return { invalid: true, reason: 'prohibited_content' };
+                }
+                // 新增：检查 finishReason 是否为 'SAFETY'
+                if (fetchRetrySettings.retryOnSafetyFinishReason && candidate.finishReason === 'SAFETY') {
+                    console.warn(`[Fetch Retry] Google AI returned 'SAFETY'. Retrying...`);
+                    return { invalid: true, reason: 'safety_reason' };
                 }
                 // Check for an empty candidate response, which can happen even with a 'STOP' reason.
                 if (!candidate.content || !candidate.content.parts || candidate.content.parts.length === 0) {
@@ -848,19 +865,19 @@ function getRetryDelay(error, response, attempt, isShortResponse = false) {
             if (fetchRetrySettings.debugMode) console.log(`[Fetch Retry Debug] Retry-After header found: ${seconds}s, adjusted delay: ${delay}ms`);
         }
     }
-    
+
     // For 429 errors, use longer delay
     if (response && response.status === 429) {
         delay = Math.max(delay, fetchRetrySettings.rateLimitDelay * Math.pow(1.5, attempt)); // Exponential backoff
         if (fetchRetrySettings.debugMode) console.log(`[Fetch Retry Debug] 429 error detected, adjusted delay: ${delay}ms`);
     }
-    
+
     // For responses that are too short, use the specific longer delay
     if (isShortResponse) {
         delay = Math.max(delay, fetchRetrySettings.shortResponseRetryDelay);
         if (fetchRetrySettings.debugMode) console.log(`[Fetch Retry Debug] Short response detected, adjusted delay: ${delay}ms`);
     }
-    
+
     // Default delay with exponential backoff
     delay = Math.max(delay, fetchRetrySettings.retryDelay * Math.pow(1.2, attempt));
     if (fetchRetrySettings.debugMode) console.log(`[Fetch Retry Debug] Final delay after exponential backoff: ${delay}ms`);
@@ -892,7 +909,7 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
         let lastError;
         let lastResponse;
         let isContentFilterRetry = false;
-        
+
         while (attempt <= fetchRetrySettings.maxRetries) {
             if (fetchRetrySettings.debugMode) console.log(`[Fetch Retry Debug] Starting fetch attempt ${attempt + 1}/${fetchRetrySettings.maxRetries + 1}`);
             if (originalSignal?.aborted) {
@@ -980,7 +997,9 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
                             }
                         }
 
-                        if (requestBody && requestBody.messages && Array.isArray(requestBody.messages)) {
+                        if (!fetchRetrySettings.adminMode) {
+                            if (fetchRetrySettings.debugMode) console.log('[Fetch Retry Debug] Admin mode is disabled, skipping aggressive transformation.');
+                        } else if (requestBody && requestBody.messages && Array.isArray(requestBody.messages)) {
                             console.log(`[Fetch Retry] Applying aggressive retry transform for prohibited content (Attempt: ${attempt}).`);
                             // Always use the aggressive transformation from admin.js for prohibited content retries, passing the current attempt number
                             requestBody = aggressiveRetryTransform(requestBody, attempt);
@@ -1032,12 +1051,12 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
                 if (fetchRetrySettings.debugMode) console.log('[Fetch Retry Debug] Fetch promise resolved or timed out.');
 
                 lastResponse = result;
-                
+
                 // Success if status 200-299
                 if (result.ok) {
                     if (fetchRetrySettings.debugMode) console.log(`[Fetch Retry Debug] Fetch successful (status ${result.status}).`);
                     let processedResult = result;
-                    
+
                     // Check if response is invalid (too short or incomplete)
                     const url = args[0] instanceof Request ? args[0].url : String(args[0]);
                     const { invalid, reason } = await isResponseInvalid(processedResult, url);
@@ -1047,9 +1066,9 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
 
                     if (invalid && attempt < fetchRetrySettings.maxRetries) {
                         console.warn(`[Fetch Retry] Response is invalid (${reason}), retrying... attempt ${attempt + 1}/${fetchRetrySettings.maxRetries + 1}`);
-                        
+
                         // When retrying for content reasons, set the flag for the next attempt
-                        if (reason === 'prohibited_content' || reason === 'google_ai_empty') {
+                        if (reason === 'prohibited_content' || reason === 'google_ai_empty') { // || reason === 'safety_reason'
                             isContentFilterRetry = true;
                             if (fetchRetrySettings.debugMode) console.log('[Fetch Retry Debug] Setting isContentFilterRetry to true.');
                         } else {
@@ -1066,7 +1085,7 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
                     if (fetchRetrySettings.debugMode) console.log('[Fetch Retry Debug] Response is valid or max retries reached for invalid response. Returning result.');
                     return processedResult;
                 }
-                
+
 // Handle specific error codes
                 if (result.status === 429) {
                     console.warn(`[Fetch Retry] Rate limited (429), attempt ${attempt + 1}/${fetchRetrySettings.maxRetries + 1}`);
@@ -1079,10 +1098,10 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
                     console.error(`[Fetch Retry] Client error (${result.status}): ${result.statusText}. Not retrying.`);
                     break; // Breaks loop and immediately returns the response
                 }
-                
+
                 console.error(`[Fetch Retry] Unexpected HTTP status: ${result.status}. Not retrying.`);
                 break;
-                
+
             } catch (err) {
                 clearTimeout(timeoutId); // Make sure timeout is cleared if there's another error
                 if (originalSignal) {
@@ -1097,10 +1116,15 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
                 let retryReason = '';
                 let isShortResponseForDelay = false; // Flag to use shortResponseRetryDelay
 
-                if (err.name === 'TimeoutError') {
+                if (err.name === 'TypeError') { // && err.message === 'Failed to fetch'
+                    // retryReason = 'Network error or CORS issue';
+                } else if (err.name === 'TimeoutError') {
                     retryReason = `AI thinking timeout (${fetchRetrySettings.thinkingTimeout}ms)`;
                     shouldRetry = true;
                     isShortResponseForDelay = true;
+                } else if (err === 'User aborted') {
+                    console.log('[Fetch Retry] Request aborted by user. Not retrying.');
+                    throw err;
                 } else if (err.name === 'AbortError') {
                     if (originalSignal?.aborted || err.message === 'User aborted') {
                         console.log('[Fetch Retry] Request aborted by user. Not retrying.');
@@ -1108,7 +1132,7 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
                     }
                     retryReason = `Request aborted (${err.message})`;
                     shouldRetry = true;
-                } else if (err.message.includes('Candidate text empty') || (lastResponse && lastResponse.status === 500 && lastError?.message?.includes('Google AI Studio Candidate text empty'))) {
+                } else if (err.message?.includes('Candidate text empty') || (lastResponse && lastResponse.status === 500 && lastError?.message?.includes('Google AI Studio Candidate text empty'))) {
                     retryReason = 'Google AI Studio Candidate text empty';
                     shouldRetry = true;
                     isShortResponseForDelay = true;
@@ -1130,40 +1154,40 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
                     console.log('[Fetch Retry] Error is not retryable. Breaking retry loop.');
                     break;
                 }
-                
+
                 // If max retries reached, break
-                
+
                 // If max retries reached, break
                 if (attempt >= fetchRetrySettings.maxRetries) {
                     console.error('[Fetch Retry] Max retries reached for current error. Breaking retry loop.');
                     break;
                 }
-                
+
                 // Determine delay for retry
                 const delay = getRetryDelay(err, lastResponse, attempt, isShortResponseForDelay);
                 console.log(`[Fetch Retry] Waiting ${delay}ms before retry...`);
-                
+
                 await new Promise(resolve => setTimeout(resolve, delay));
                 attempt++;
                 // isContentFilterRetry is now managed by the specific conditions above, no unconditional reset here.
             }
         }
-        
+
 // If we get here, either all attempts failed or we intentionally broke out
         if (attempt >= fetchRetrySettings.maxRetries && lastError) {
             console.error(`[Fetch Retry] All ${fetchRetrySettings.maxRetries + 1} attempts failed. Final error:`, lastError);
             showErrorNotification(lastError, lastResponse);
         }
-        
+
         // Preserve native fetch behavior: if we have a valid response (even if it's 404 or 500), return it.
         // fetch() should only throw/reject on actual network failures or aborts.
         if (lastResponse) {
             return lastResponse;
         }
-        
+
         throw lastError;
     };
-    
+
     (/** @type {any} */ (window))._fetchRetryPatched = true;
     console.log('[Fetch Retry] Extension loaded and fetch patched successfully.');
 }
