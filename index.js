@@ -922,18 +922,19 @@ function removeThoughtSignatureKeys(value) {
 }
 
 /**
- * Strip `thoughtSignature` keys from the JSON payload of a single SSE line.
- * Lines without a parsable JSON `data:` payload are returned unchanged.
- * @param {string} line One SSE line (without the trailing newline)
+ * Strip `thoughtSignature` keys from the JSON payload of a single body line.
+ * Handles both SSE `data:` payloads and bare JSON lines (streaming generation
+ * responses are forwarded by the SillyTavern server without a content-type
+ * header, so the payload format is detected per line).
+ * Lines without a parsable JSON payload are returned unchanged.
+ * @param {string} line One body line (without the trailing newline)
  * @returns {string} The processed line
  */
 function stripThoughtSignatureFromSseLine(line) {
     const hasCarriageReturn = line.endsWith('\r');
     const content = hasCarriageReturn ? line.slice(0, -1) : line;
-    if (!content.startsWith('data:')) {
-        return line;
-    }
-    const separatorLength = content.startsWith('data: ') ? 6 : 5;
+    const isDataLine = content.startsWith('data:');
+    const separatorLength = isDataLine ? (content.startsWith('data: ') ? 6 : 5) : 0;
     const payload = content.slice(separatorLength);
     if (!payload) {
         return line;
@@ -952,8 +953,11 @@ function stripThoughtSignatureFromSseLine(line) {
 
 /**
  * When the setting is enabled, return a copy of a generation response (LLM-generated
- * message) with every `thoughtSignature` key removed. JSON and streaming (SSE)
- * bodies are supported; anything else is returned untouched.
+ * message) with every `thoughtSignature` key removed. JSON and streaming (SSE /
+ * line-based) bodies are supported; anything else is returned untouched.
+ * Note: the SillyTavern server forwards streaming generation responses without a
+ * content-type header (see forwardFetchResponse), so untyped text-like bodies
+ * are processed line by line as well.
  * @param {Response} response The response to process
  * @param {string} url The request URL
  * @returns {Promise<Response>} The processed response
@@ -984,7 +988,7 @@ async function removeThoughtSignatureFromResponse(response, url = '') {
             console.log('[Fetch Retry] Removed thoughtSignature keys from generation response.');
             return strippedResponse;
         }
-        if (contentType.includes('text/event-stream')) {
+        if (contentType.includes('text/event-stream') || !contentType || contentType.includes('text/') || contentType.includes('json')) {
             const decoder = new TextDecoder();
             const encoder = new TextEncoder();
             let buffered = '';
